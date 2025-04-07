@@ -1,44 +1,28 @@
 // utils/upload.js
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const sharp = require('sharp');
 const { v4: uuidv4 } = require('uuid');
+const { minioClient } = require('./minio');
 
-// 配置项
+// 配置项优化
 const config = {
-  uploadDir: 'public/uploads',
-  thumbnailDir: 'public/uploads/thumbnails',
   allowedMimeTypes: ['image/jpeg', 'image/png', 'image/webp', 'image/avif'],
   maxFileSize: 10 * 1024 * 1024, // 10MB
   imageSizes: {
     thumbnail: { width: 300, height: 300, fit: 'cover' },
     medium: { width: 800, height: 600, fit: 'inside' }
-  }
+  },
+  minioBucket: process.env.MINIO_BUCKET || 'menu-images'
 };
 
-// 创建上传目录结构
-function createDirectories() {
-  const dirs = [config.uploadDir, config.thumbnailDir];
-  dirs.forEach(dir => {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-  });
-}
-createDirectories();
+// 生成唯一文件名
+const generateFileName = (originalName) => {
+  const ext = originalName.split('.').pop().toLowerCase();
+  return `${uuidv4()}.${ext}`;
+};
 
-// 存储引擎配置
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, config.uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const filename = `${uuidv4()}${ext}`;
-    cb(null, filename);
-  }
-});
+// 内存存储配置
+const storage = multer.memoryStorage();
 
 // 文件过滤器
 const fileFilter = (req, file, cb) => {
@@ -56,48 +40,64 @@ const baseUpload = multer({
   fileFilter: fileFilter
 });
 
-// 图片处理器中间件
+// 图片处理器中间件（MinIO集成版）
 const processImages = async (req, res, next) => {
   if (!req.files || req.files.length === 0) return next();
 
   try {
     req.processedFiles = await Promise.all(
-      req.files.map(async file => {
-         // 添加文件存在性检查
-         if (!file || !file.path) throw new Error('文件上传失败');
-        
-        const originalPath = path.join(config.uploadDir, file.filename);
-        const thumbnailPath = path.join(config.thumbnailDir, file.filename);
+      req.files.map(async (file) => {
+        try {
+          // 基础校验
+          if (!file.buffer) throw new Error('文件内容为空');
+          
+          // 生成多尺寸图片
+          const originalBuffer = await sharp(file.buffer)
+            .resize(1920, 1080, { fit: 'inside' })
+            .toBuffer();
 
-        // 生成缩略图
-        await sharp(originalPath)
-          .resize(config.imageSizes.thumbnail.width, config.imageSizes.thumbnail.height, {
-            fit: config.imageSizes.thumbnail.fit
-          })
-          .toFile(thumbnailPath);
+          const thumbnailBuffer = await sharp(file.buffer)
+            .resize(config.imageSizes.thumbnail.width, config.imageSizes.thumbnail.height)
+            .toBuffer();
 
-        // 生成中等尺寸图片
-        const mediumPath = path.join(config.uploadDir, `medium_${file.filename}`);
-        await sharp(originalPath)
-          .resize(config.imageSizes.medium.width, config.imageSizes.medium.height, {
-            fit: config.imageSizes.medium.fit
-          })
-          .toFile(mediumPath);
+          const mediumBuffer = await sharp(file.buffer)
+            .resize(config.imageSizes.medium.width, config.imageSizes.medium.height)
+            .toBuffer();
 
-        return {
-          original: `/uploads/${file.filename}`,
-          thumbnail: `/uploads/thumbnails/${file.filename}`,
-          medium: `/uploads/medium_${file.filename}`
-        };
+          // 上传到MinIO
+          const uploadFile = async (buffer, suffix = '') => {
+            const objectName = generateFileName(file.originalname) + suffix;
+            await minioClient.putObject(
+              config.minioBucket,
+              objectName,
+              buffer,
+              buffer.length,
+              { 'Content-Type': file.mimetype }
+            );
+            return `${process.env.MINIO_PUBLIC_URL}/${config.minioBucket}/${objectName}`;
+          };
+
+          // 并行上传所有版本
+          const [original, thumbnail, medium] = await Promise.all([
+            uploadFile(originalBuffer),
+            uploadFile(thumbnailBuffer, '_thumbnail'),
+            uploadFile(mediumBuffer, '_medium')
+          ]);
+
+          return { original, thumbnail, medium };
+
+        } catch (error) {
+          console.error('图片处理失败:', {
+            filename: file.originalname,
+            error: error.message
+          });
+          throw error;
+        }
       })
     );
 
     next();
   } catch (error) {
-    // 清理已上传文件
-    req.files.forEach(file => {
-      fs.unlinkSync(file.path);
-    });
     next(error);
   }
 };
@@ -110,40 +110,44 @@ const createUpload = (fieldName, maxCount = 5) => {
   ];
 };
 
-// 导出中间件
+// 错误处理中间件增强
+const handleUploadErrors = (err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    const errors = {
+      LIMIT_FILE_SIZE: {
+        status: 413,
+        message: `文件大小超过限制（最大 ${config.maxFileSize / 1024 / 1024}MB）`
+      },
+      LIMIT_FILE_COUNT: {
+        status: 400,
+        message: `超过最大文件数量限制`
+      }
+    };
+    
+    const errorConfig = errors[err.code] || { status: 400, message: err.message };
+    return res.status(errorConfig.status).json({ error: errorConfig.message });
+  }
+  
+  if (err) {
+    console.error('上传系统错误:', {
+      error: err.stack,
+      body: req.body
+    });
+    return res.status(500).json({ error: '文件处理系统异常' });
+  }
+  
+  next();
+};
+
 module.exports = {
-  // 单图上传（用于封面）
   singleUpload: [
     baseUpload.single('cover'),
-    async (req, res, next) => {
-      if (!req.file) return next();
-      try {
-        const processed = await processImages({ files: [req.file] }, res, next);
-        req.coverImage = processed[0];
-        next();
-      } catch (error) {
-        next(error);
-      }
+    processImages,
+    (req, res, next) => {
+      if (req.file) req.coverImage = req.processedFiles[0];
+      next();
     }
   ],
-
-  // 多图上传（用于步骤图片）
   multiUpload: createUpload('images', 10),
-
-  // 错误处理中间件
-  handleUploadErrors: (err, req, res, next) => {
-    if (err instanceof multer.MulterError) {
-      if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(413).json({ 
-          error: '文件大小超过限制',
-          maxSize: `${config.maxFileSize / 1024 / 1024}MB`
-        });
-      }
-      return res.status(400).json({ error: err.message });
-    }
-    if (err) {
-      return res.status(500).json({ error: '文件处理失败' });
-    }
-    next();
-  }
+  handleUploadErrors
 };

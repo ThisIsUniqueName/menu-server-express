@@ -82,3 +82,90 @@
 ```bash
 git clone https://github.com/ThisIsUniqueName/menu-server-express.git
 cd menu-server
+
+2. 安装依赖
+npm install
+
+3. 环境配置
+cp .env.example .env
+# 编辑.env文件配置数据库等信息
+
+4. 数据库迁移
+npx sequelize-cli db:migrate
+npx sequelize-cli db:seed:all
+
+5. 启动服务
+npm run dev
+
+
+配置说明
+
+.env 文件示例
+# 服务器配置
+PORT=3000
+NODE_ENV=development
+
+# 数据库配置
+DB_NAME=menu_db
+DB_USER=root
+DB_PASSWORD=yourpassword
+DB_HOST=localhost
+DB_PORT=3306
+
+# JWT配置
+JWT_SECRET=your_jwt_secret
+JWT_EXPIRES=2h
+
+# 文件上传
+UPLOAD_DIR=./public/uploads
+MAX_FILE_SIZE=5MB
+
+API文档
+
+主要接口示例
+
+用户注册
+POST /api/auth/register
+Content-Type: application/json
+
+{
+  "name": "user123",
+  "password": "StrongP@ssw0rd"
+}
+
+菜谱创建
+
+POST /api/recipes
+Authorization: Bearer <your_jwt_token>
+Content-Type: multipart/form-data
+
+- dish_name: 红烧肉
+- summary_time: 90
+- steps: [{"order":1,"desc":"焯水处理"},...]
+- cover: (文件上传)
+
+标签检索
+GET /api/tags?q=家常菜&page=1
+完整API文档参见 
+
+核心表结构：
+CREATE TABLE Recipes (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  dish_name VARCHAR(255) NOT NULL,
+  cover_url VARCHAR(512),
+  summary_time INT,
+  author_id INT REFERENCES Users(id),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+部署指南
+生产环境部署建议
+
+使用PM2进行进程管理
+配置Nginx反向代理
+启用HTTPS
+定期数据库备份
+日志轮转配置
+
+Docker部署
+

@@ -127,7 +127,5 @@ router.post('/register', async (req, res) => {
     }
 });
 
-// token刷新接口（可根据需要添加）
-// router.post('/refresh', ...);
 
 module.exports = router; // ✅ 正确导出路由实例

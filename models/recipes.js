@@ -42,6 +42,19 @@ module.exports = (sequelize) => {
     steps: {
       type: DataTypes.JSON,
       allowNull: true
+    }, images: {
+      type: DataTypes.JSON,
+      allowNull: false,
+      defaultValue: [],
+      get() {
+        const rawValue = this.getDataValue('images');
+        // 确保返回标准化的数据结构
+        return rawValue.map(img => ({
+          original: img.original || '',
+          thumbnail: img.thumbnail || '',
+          medium: img.medium || ''
+        }));
+      }
     },
     author_id: {
         type: DataTypes.INTEGER,
@@ -50,14 +63,24 @@ module.exports = (sequelize) => {
           key: 'id'
         }
       },
-    is_public: {
-        type: DataTypes.TINYINT(1), // 明确指定类型
-        allowNull: false,
-        defaultValue: 0, // 设置默认值
-        validate: {
-          isIn: [[0, 1]] // 限制取值范围
+      is_public: {
+        type: DataTypes.BOOLEAN,
+        defaultValue: false,
+        set(value) {
+          // 处理数字类型输入
+          if ([0, 1].includes(Number(value))) {
+            this.setDataValue('is_public', Boolean(Number(value)));
+          } 
+          // 处理字符串类型输入
+          else if (typeof value === 'string') {
+            this.setDataValue('is_public', value.toLowerCase() === 'true');
+          } 
+          // 处理布尔值
+          else {
+            this.setDataValue('is_public', !!value);
+          }
         }
-    }
+      }
   }, {
     tableName: 'Recipes',
     timestamps: true,

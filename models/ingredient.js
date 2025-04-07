@@ -8,6 +8,11 @@ module.exports = (sequelize, DataTypes) => {
         type: DataTypes.STRING,
         allowNull: false
       },
+      category: {
+        type: DataTypes.STRING,
+        allowNull: false, // 强制要求非空
+        defaultValue: '其他',
+      },
       amount: DataTypes.STRING,
       tip: DataTypes.STRING
     }, {

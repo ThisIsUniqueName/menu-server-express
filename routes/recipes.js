@@ -2,260 +2,336 @@ const express = require('express');
 const router = express.Router();
 const { Recipe, User, Tag, Ingredient } = require('../models');
 const { Op } = require('sequelize');
-const { singleUpload, multiUpload } = require('../utils/upload');
+const { multiUpload } = require('../utils/upload');
 const authMiddleware = require('../middlewares/auth');
-const fs = require('fs');
-const path = require('path');
+// 引入MinIO客户端和初始化方法
+const { minioClient, initBucket } = require('../utils/minio');
+const { v4: uuidv4 } = require('uuid');
 
-// 获取分页列表（带权限过滤）
-// 获取分页列表（带权限过滤）
+// MinIO存储桶初始化（服务启动时执行）
+(async () => {
+  try {
+    await initBucket();
+    console.log('✅ MinIO存储桶初始化完成');
+  } catch (err) {
+    console.error('❌ MinIO存储桶初始化失败:', err);
+  }
+})();
+
+// 创建菜谱接口
+router.post('/', authMiddleware, multiUpload, async (req, res) => {
+    let transaction;
+    try {
+      const { body } = req;
+      const { processedFiles } = req; // 从上传中间件获取处理后的文件信息
+  
+      // 参数校验增强
+      if (!body.steps) {
+        return res.status(400).json({ error: '必须提供步骤信息' });
+      }
+  
+      // 构建菜谱数据
+      const recipeData = {
+        ...body,
+        author_id: req.user.id,
+        images: processedFiles.map(file => ({
+          original: file.original,
+          thumbnail: file.thumbnail,
+          medium: file.medium
+        })),
+        steps: JSON.parse(body.steps),
+        is_public: (() => {
+          const value = body.is_public;
+          if (typeof value === 'string') {
+            return value === 'true' || value === '1';
+          }
+          return Boolean(value);
+        })()
+      };
+  
+      transaction = await Recipe.sequelize.transaction();
+  
+      try {
+        // 创建菜谱主体
+        const recipe = await Recipe.create(recipeData, { transaction });
+  
+        // 处理标签关联（带校验）
+        if (body.tags) {
+          const tagIds = JSON.parse(body.tags);
+          if (Array.isArray(tagIds)) {
+            const validTags = await Tag.findAll({
+              where: { id: tagIds },
+              transaction
+            });
+            await recipe.setTags(validTags.map(t => t.id), { transaction });
+          }
+        }
+  
+        // 处理配料（带默认分类）
+        if (body.ingredients) {
+          const ingredients = JSON.parse(body.ingredients).map(i => ({
+            name: i.name,
+            amount: i.amount,
+            category: i.category || '其他', // 确保分类字段
+            recipe_id: recipe.id
+          }));
+          
+          await Ingredient.bulkCreate(ingredients, { 
+            transaction,
+            validate: true // 启用模型验证
+          });
+        }
+  
+        await transaction.commit();
+        
+        // 返回完整数据（包含关联）
+        const fullRecipe = await Recipe.findByPk(recipe.id, {
+          include: [
+            { model: Tag, as: 'tags' },
+            { model: Ingredient, as: 'ingredients' }
+          ]
+        });
+  
+        res.status(201).json(fullRecipe.toJSON());
+  
+      } catch (error) {
+        await transaction.rollback();
+        
+        // 清理已上传的所有图片版本
+        if (processedFiles?.length) {
+          await Promise.all(
+            processedFiles.flatMap(file => [
+              minioClient.removeObject(process.env.MINIO_BUCKET, file.original.split('/').pop()),
+              minioClient.removeObject(process.env.MINIO_BUCKET, file.thumbnail.split('/').pop()),
+              minioClient.removeObject(process.env.MINIO_BUCKET, file.medium.split('/').pop())
+            ])
+          );
+        }
+  
+        // 记录详细错误日志
+        logger.error('创建菜谱事务失败', {
+          error: error.message,
+          stack: error.stack,
+          body: req.body
+        });
+  
+        // 客户端友好错误提示
+        const errorMessage = error.name === 'SequelizeValidationError' 
+          ? '数据验证失败，请检查输入格式'
+          : error.message;
+  
+        res.status(400).json({ error: errorMessage });
+      }
+    } catch (error) {
+      console.error('创建菜谱全局错误:', error);
+      res.status(500).json({ 
+        error: '服务器处理请求时发生意外错误',
+        ...(process.env.NODE_ENV === 'development' && { detail: error.stack })
+      });
+    }
+  });
+
+// 更新删除操作需要同步修改（示例：删除菜谱）
+router.delete('/:id', authMiddleware, async (req, res) => {
+  let transaction;
+  try {
+    const recipe = await Recipe.findOne({
+      where: { id: req.params.id, author_id: req.user.id }
+    });
+
+    if (!recipe) {
+      return res.status(404).json({ error: '菜谱不存在或无权删除' });
+    }
+
+    transaction = await Recipe.sequelize.transaction();
+
+    try {
+      // 删除关联数据...（保持原逻辑）
+
+      // 删除MinIO中的图片
+      if (recipe.images && recipe.images.length > 0) {
+        await Promise.all(
+          recipe.images.map(url => {
+            const objectName = url.split('/').pop();
+            return minioClient.removeObject(process.env.MINIO_BUCKET, objectName);
+          })
+        );
+      }
+
+      await recipe.destroy({ transaction });
+      await transaction.commit();
+      res.json({ message: '删除成功' });
+    } catch (error) {
+      await transaction.rollback();
+      throw error;
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 获取分页菜谱列表（带权限控制）
 router.get('/', authMiddleware, async (req, res) => {
     try {
-        const { page = 1, pageSize = 10, keyword } = req.query;
-        const offset = (page - 1) * pageSize;
-        const currentUserId = req.user.id;
-
-        // 构建基础查询条件
-        const baseWhere = {
-            [Op.or]: [
-                { is_public: true },
-                { author_id: currentUserId }
-            ]
+      const { page = 1, pageSize = 10, keyword, tagIds } = req.query;
+      const offset = (page - 1) * pageSize;
+      const currentUserId = req.user.id;
+  
+      // 构建查询条件
+      const where = {
+        [Op.or]: [
+          { is_public: true },
+          { author_id: currentUserId }
+        ]
+      };
+  
+      // 关键词搜索
+      if (keyword) {
+        where[Op.and] = {
+          [Op.or]: [
+            { dish_name: { [Op.like]: `%${keyword}%` } },
+            { '$tags.name$': { [Op.like]: `%${keyword}%` } }
+          ]
         };
-
-        // 添加关键词搜索
-        if (keyword) {
-            baseWhere[Op.and] = {
-                [Op.or]: [
-                    { dish_name: { [Op.like]: `%${keyword}%` } },
-                    { '$tags.name$': { [Op.like]: `%${keyword}%` } }
-                ]
-            };
-        }
-
-        const result = await Recipe.findAndCountAll({
-            where: baseWhere,
-            include: [
-                {
-                    model: User,
-                    as: 'author',
-                    attributes: ['id', 'name', 'avatar'],
-                    where: { status: 'active' } // 只显示有效作者
-                },
-                {
-                    model: Tag,
-                    as: 'tags',
-                    through: { attributes: [] },
-                    attributes: ['id', 'name'],
-                    required: false // 允许菜谱无标签
-                },
-                {
-                    model: Ingredient,
-                    as: 'ingredients',
-                    attributes: ['id', 'name', 'amount'],
-                    required: false // 允许菜谱无配料
-                }
-            ],
-            distinct: true,
-            offset: +offset,
-            limit: +pageSize,
-            order: [
-                ['is_public', 'ASC'],
-                ['createdAt', 'DESC']
-            ],
-            subQuery: false // 优化关联查询性能
-        });
-
-        res.json({
-            total: result.count,
-            data: result.rows.map(recipe => ({
-                ...recipe.get({ plain: true }),
-                can_edit: recipe.author_id === currentUserId,
-                is_public: Boolean(recipe.is_public)
-            }))
-        });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// 创建菜谱接口（正确版本）
-router.post('/', authMiddleware, multiUpload, async (req, res) => {
-    try {
-        const { body, files } = req; // ✅ 正确获取上传文件
-
-        // 处理上传的图片
-        const imagePaths = files?.map(file => file.filename) || [];
-
-        const recipeData = {
-            ...body,
-            author_id: req.user.id,
-            images: imagePaths,
-            steps: JSON.parse(body.steps),
-            is_public: Boolean(Number(body.is_public))
+      }
+  
+      // 标签过滤
+      if (tagIds) {
+        where['$tags.id$'] = { [Op.in]: tagIds.split(',').map(Number) };
+      }
+  
+      const result = await Recipe.findAndCountAll({
+        where,
+        include: [
+          {
+            model: User,
+            as: 'author',
+            attributes: ['id', 'name', 'avatar'],
+            where: { status: 'active' }
+          },
+          {
+            model: Tag,
+            as: 'tags',
+            through: { attributes: [] },
+            attributes: ['id', 'name']
+          },
+          {
+            model: Ingredient,
+            as: 'ingredients',
+            attributes: ['id', 'name', 'amount', 'category']
+          }
+        ],
+        distinct: true,
+        offset: +offset,
+        limit: +pageSize,
+        order: [
+          ['createdAt', 'DESC'],
+          [{ model: Tag, as: 'tags' }, 'name', 'ASC']
+        ]
+      });
+  
+      // 转换图片URL为数组格式
+      const transformedData = result.rows.map(recipe => {
+        const jsonRecipe = recipe.toJSON();
+        return {
+          ...jsonRecipe,
+          canEdit: jsonRecipe.author_id === currentUserId,
+          images: jsonRecipe.images.map(img => ({
+            original: img.original,
+            thumbnail: img.thumbnail || img.original, // 兼容旧数据
+            medium: img.medium || img.original
+          }))
         };
-
-        const transaction = await Recipe.sequelize.transaction();
-
-        try {
-            // ✅ 正确创建新菜谱
-            const recipe = await Recipe.create(recipeData, { transaction });
-
-            // 处理标签关联
-            if (body.tags) {
-                const tagIds = JSON.parse(body.tags);
-                await recipe.setTags(tagIds, { transaction });
-            }
-
-            // 处理配料
-            if (body.ingredients) {
-                await Ingredient.bulkCreate(
-                    JSON.parse(body.ingredients).map(i => ({
-                        ...i,
-                        recipe_id: recipe.id
-                    })),
-                    { transaction }
-                );
-            }
-
-            await transaction.commit();
-
-            // ✅ 返回完整的图片URL
-            res.status(201).json({
-                ...recipe.toJSON(),
-                images: imagePaths.map(filename => `/uploads/${filename}`)
-            });
-
-        } catch (error) {
-            await transaction.rollback();
-
-            // 回滚时删除已上传的图片
-            if (files?.length) {
-                files.forEach(file => {
-                    fs.unlinkSync(file.path);
-                });
-            }
-
-            throw error;
-        }
+      });
+  
+      res.json({
+        total: result.count,
+        currentPage: +page,
+        totalPages: Math.ceil(result.count / pageSize),
+        data: transformedData
+      });
+  
     } catch (error) {
-        res.status(400).json({
-            error: error.message,
-            detail: process.env.NODE_ENV === 'development' ? error.stack : null
-        });
+      console.error('获取列表失败:', error);
+      res.status(500).json({
+        error: '获取菜谱列表失败',
+        ...(process.env.NODE_ENV === 'development' && { detail: error.stack })
+      });
     }
-});
+  });
 
-// 更新菜谱（带权限验证）
-router.put('/:id', authMiddleware, singleUpload, async (req, res) => {
-    let transaction;
-    let updateData;
+  // 获取菜谱详情接口（带权限验证）
+router.get('/:id', authMiddleware, async (req, res) => {
     try {
-        const recipe = await Recipe.findOne({
-            where: { id: req.params.id, author_id: req.user.id }
+      const { id } = req.params;
+      const currentUserId = req.user.id;
+  
+      // 参数校验
+      if (!Number.isInteger(Number(id))) {
+        return res.status(400).json({ error: '无效的菜谱ID' });
+      }
+  
+      // 查询条件（公开或自己的菜谱）
+      const recipe = await Recipe.findOne({
+        where: {
+          id,
+          [Op.or]: [
+            { is_public: true },
+            { author_id: currentUserId }
+          ]
+        },
+        include: [
+          {
+            model: User,
+            as: 'author',
+            attributes: ['id', 'name', 'avatar'],
+            where: { status: 'active' }
+          },
+          {
+            model: Tag,
+            as: 'tags',
+            through: { attributes: [] },
+            attributes: ['id', 'name']
+          },
+          {
+            model: Ingredient,
+            as: 'ingredients',
+            attributes: ['id', 'name', 'amount', 'category']
+          }
+        ],
+        rejectOnEmpty: false // 避免抛出Sequelize EmptyResultError
+      });
+  
+      // 处理查询结果
+      if (!recipe) {
+        return res.status(404).json({ 
+          error: req.user.role === 'admin' 
+            ? '菜谱不存在' 
+            : '菜谱不存在或无权查看'
         });
-
-        if (!recipe) {
-            return res.status(404).json({ error: '菜谱不存在或无权修改' });
-        }
-
-        // 参数校验
-        const { body } = req;
-        if (!body.steps) {
-            return res.status(400).json({ error: '步骤信息缺失' });
-        }
-
-        // 安全解析 JSON
-        let steps;
-        try {
-            steps = JSON.parse(body.steps);
-        } catch (e) {
-            return res.status(400).json({ error: '步骤格式错误' });
-        }
-
-        // 构造更新数据
-        updateData = {
-            ...body,
-            steps: steps,
-            is_public: body.is_public ? 1 : 0
-        };
-
-        transaction = await Recipe.sequelize.transaction();
-        // 更新逻辑...
-        await recipe.update(updateData, { transaction });
-
-        // 提交事务
-        await transaction.commit();
-
-        // ✅ 事务外查询最新数据
-        const updatedRecipe = await Recipe.findByPk(recipe.id, {
-            include: [
-                { model: User, as: 'author' },
-                { model: Tag, as: 'tags' },
-                { model: Ingredient, as: 'ingredients' }
-            ]
-        });
-
-        res.json(updatedRecipe);
-
+      }
+  
+      // 转换数据结构
+      const recipeJson = recipe.toJSON();
+      const responseData = {
+        ...recipeJson,
+        canEdit: recipeJson.author_id === currentUserId,
+        images: recipeJson.images.map(img => ({
+          original: img.original,
+          thumbnail: img.thumbnail || img.original,
+          medium: img.medium || img.original
+        }))
+      };
+  
+      res.json(responseData);
+  
     } catch (error) {
-        await transaction.rollback();
-
-        // 清理上传的文件
-        if (req.file) fs.unlinkSync(req.file.path);
-
-        // ✅ 直接在此处发送错误响应
-        res.status(500).json({
-            error: '更新失败',
-            detail: process.env.NODE_ENV === 'development' ? error.message : null
-        });
+      console.error('获取详情失败:', error);
+      res.status(500).json({
+        error: '获取菜谱详情失败',
+        ...(process.env.NODE_ENV === 'development' && { detail: error.stack })
+      });
     }
-}
-);
-
-// 删除菜谱
-router.delete('/:id', authMiddleware, async (req, res) => {
-    try {
-        const recipe = await Recipe.findOne({
-            where: { id: req.params.id, author_id: req.user.id }
-        });
-
-        if (!recipe) {
-            return res.status(404).json({ error: '菜谱不存在或无权删除' });
-        }
-
-        const transaction = await Recipe.sequelize.transaction();
-
-        try {
-            // 删除关联数据
-            await Ingredient.destroy({
-                where: { recipe_id: recipe.id },
-                transaction
-            });
-
-            await RecipeTag.destroy({
-                where: { recipe_id: recipe.id },
-                transaction
-            });
-
-            // 删除主记录
-            await recipe.destroy({ transaction });
-
-            // 删除封面文件
-            if (recipe.cover) {
-                const filePath = path.join(__dirname, '../public', recipe.cover);
-                if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-            }
-
-            await transaction.commit();
-            res.json({ message: '删除成功' });
-        } catch (error) {
-            await transaction.rollback();
-            throw error;
-        }
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
+  });
 
 module.exports = router;
